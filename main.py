@@ -21,15 +21,12 @@ logger = logging.getLogger(__name__)
 app = Flask(__name__)
 
 # --- 1. 設定 API 金鑰庫 (安全讀取版) ---
-# 從環境變數讀取金鑰，而不是寫死在程式碼裡
 raw_keys = [
     os.environ.get('GEMINI_API_KEY_1'),
     os.environ.get('GEMINI_API_KEY_2'),
     os.environ.get('GEMINI_API_KEY_3'),
-    os.environ.get('GEMINI_API_KEY') # 兼容舊設定
+    os.environ.get('GEMINI_API_KEY') 
 ]
-
-# 過濾掉空的 Key (避免讀到 None)
 API_KEY_POOL = [k for k in raw_keys if k and k.strip()]
 
 if not API_KEY_POOL:
@@ -48,22 +45,25 @@ safety_settings = {
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
 }
 
-# --- 3. Piped 替身伺服器 ---
+# --- 3. Piped 替身伺服器 (已調整順序，踢掉不穩的 kavin) ---
 PIPED_INSTANCES = [
-    "https://pipedapi.kavin.rocks",
-    "https://api.piped.privacy.com.de",
-    "https://api.piped.projectsegfau.lt",
-    "https://pipedapi.tokhmi.xyz",
-    "https://pipedapi.moomoo.me",
-    "https://api.piped.yt"
+    "https://pipedapi.tokhmi.xyz",       # 目前較穩
+    "https://pipedapi.moomoo.me",        # 備用 1
+    "https://api.piped.projectsegfau.lt",# 備用 2
+    "https://api.piped.privacy.com.de",  # 備用 3
+    "https://api.piped.yt",              # 官方 (容易限流)
+    "https://pipedapi.kavin.rocks"       # 容易 502，移到最後
 ]
 
 def get_transcript_via_piped(video_id):
     for instance in PIPED_INSTANCES:
         try:
+            # logger.info(f"嘗試替身: {instance}") # 減少 log
             url = f"{instance}/streams/{video_id}"
             response = requests.get(url, timeout=5)
+            
             if response.status_code != 200: continue
+            
             data = response.json()
             subtitles = data.get('subtitles', [])
             if not subtitles: continue
@@ -80,13 +80,28 @@ def get_transcript_via_piped(video_id):
             if not target_sub and subtitles: target_sub = subtitles[0]
 
             if target_sub:
-                sub_text = requests.get(target_sub['url']).text
+                sub_text = requests.get(target_sub['url'], timeout=5).text
+                
+                # 🔥 關鍵修正：檢查抓回來的內容是不是「錯誤網頁」 🔥
+                if "<!DOCTYPE html>" in sub_text or "Bad Gateway" in sub_text or "Cloudflare" in sub_text:
+                    logger.warning(f"⚠️ {instance} 回傳了錯誤頁面 (502/Cloudflare)，跳過...")
+                    continue
+
+                # 清理 VTT 格式
                 clean_text = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}', '', sub_text)
                 clean_text = re.sub(r'<[^>]+>', '', clean_text) 
                 clean_text = re.sub(r'WEBVTT|Kind: captions|Language: .*', '', clean_text)
                 lines = [line.strip() for line in clean_text.split('\n') if line.strip()]
-                return " ".join(list(dict.fromkeys(lines)))
-        except: continue
+                
+                final_text = " ".join(list(dict.fromkeys(lines)))
+                if len(final_text) < 50: # 如果字幕太短也不對勁
+                    continue
+                    
+                return final_text
+
+        except Exception as e:
+            continue
+            
     return None
 
 # --- 4. 核心功能：分析影片 ---
@@ -102,6 +117,7 @@ def get_video_content(video_url):
         full_text = None
         source_type = "未知"
 
+        # 策略 A: 官方 API
         try:
             transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
             transcript = list(transcript_list)[0]
@@ -109,12 +125,14 @@ def get_video_content(video_url):
             source_type = "CC字幕(官方)"
         except: pass
 
+        # 策略 B: Piped 替身
         if not full_text:
             proxy_text = get_transcript_via_piped(video_id)
             if proxy_text:
                 full_text = proxy_text
                 source_type = "CC字幕(替身)"
 
+        # 策略 C: Groq 語音轉錄
         if not full_text:
             try:
                 ydl_opts = {'format': 'bestaudio[ext=m4a]/bestaudio', 'outtmpl': '/tmp/%(id)s.%(ext)s', 'noplaylist': True}
@@ -143,7 +161,6 @@ def summarize_text(text):
     {text[:30000]}
     """
 
-    # 你的可用模型清單 (根據之前 Log 確認過的)
     priority_models = [
         "gemini-2.5-flash",        
         "gemini-2.0-flash-exp",    
@@ -151,15 +168,12 @@ def summarize_text(text):
         "gemini-2.0-flash-lite-preview-02-05" 
     ]
 
-    # --- 智慧金鑰輪替邏輯 ---
-    # 複製金鑰池 (避免影響全域變數)
     keys_to_try = API_KEY_POOL.copy()
-    random.shuffle(keys_to_try) # 隨機洗牌，達成負載平衡
+    random.shuffle(keys_to_try) 
     
     last_error = ""
 
     for key_index, current_key in enumerate(keys_to_try):
-        # 隱碼處理 log
         masked_key = current_key[:5] + "..." + current_key[-4:]
         logger.info(f"🔑 [Key {key_index+1}/{len(keys_to_try)}] 切換金鑰: {masked_key}")
         
@@ -174,16 +188,15 @@ def summarize_text(text):
             except Exception as e:
                 error_msg = str(e)
                 if "429" in error_msg:
-                    logger.warning(f"⚠️ 額度不足 (429) - 模型: {model_name}，準備切換...")
+                    logger.warning(f"⚠️ 額度不足 (429) - {model_name}")
                 elif "404" in error_msg:
-                    logger.warning(f"⚠️ 模型未授權 (404) - 模型: {model_name}，跳過...")
+                    logger.warning(f"⚠️ 模型未授權 (404) - {model_name}")
                 else:
                     logger.error(f"❌ 錯誤: {error_msg}")
-                
                 last_error = error_msg
                 continue 
 
-    return f"AI 生成失敗 (已嘗試 {len(keys_to_try)} 組 Key)。最後錯誤: {last_error}"
+    return f"AI 生成失敗。原因: {last_error}"
 
 # --- 6. LINE Webhook ---
 @app.route("/callback", methods=['POST'])

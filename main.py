@@ -1,12 +1,11 @@
 import os
-import json
-import time
+import re
+import requests
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
 from linebot.models import TextSendMessage, MessageEvent, TextMessage
 from youtube_transcript_api import YouTubeTranscriptApi
-from youtube_transcript_api.formatters import TextFormatter
 import google.generativeai as genai
 from groq import Groq
 import yt_dlp
@@ -19,10 +18,59 @@ handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
 groq_client = Groq(api_key=os.environ.get('GROQ_API_KEY'))
 
+# --- 新增功能：替身攻擊 (透過 Piped API 繞過封鎖) ---
+def get_transcript_via_proxy(video_id):
+    try:
+        print(f"啟動替身模式 (Piped API) 分析: {video_id}")
+        # 使用 Piped API 抓取字幕列表
+        url = f"https://pipedapi.kavin.rocks/streams/{video_id}"
+        response = requests.get(url, timeout=10)
+        data = response.json()
+        
+        subtitles = data.get('subtitles', [])
+        target_sub = None
+        
+        # 1. 優先找繁體/正體中文
+        for sub in subtitles:
+            if sub.get('code') in ['zh-TW', 'zh-Hant']:
+                target_sub = sub
+                break
+        
+        # 2. 其次找通用中文
+        if not target_sub:
+            for sub in subtitles:
+                if 'zh' in sub.get('code', ''):
+                    target_sub = sub
+                    break
+                    
+        # 3. 再不行找英文
+        if not target_sub:
+            for sub in subtitles:
+                if 'en' in sub.get('code', ''):
+                    target_sub = sub
+                    break
+        
+        # 4. 真的沒有就抓第一個 (包含自動產生)
+        if not target_sub and subtitles:
+            target_sub = subtitles[0]
+            
+        if target_sub:
+            # 下載字幕內容
+            print(f"找到字幕: {target_sub['name']} ({target_sub['code']})")
+            sub_text = requests.get(target_sub['url']).text
+            # 簡單清理 VTT 格式的時間軸 (讓 AI 比較好讀)
+            clean_text = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}', '', sub_text)
+            clean_text = re.sub(r'<[^>]+>', '', clean_text) # 去除 HTML 標籤
+            return clean_text
+            
+        return None
+    except Exception as e:
+        print(f"替身模式失敗: {e}")
+        return None
+
 # 核心功能：分析影片
 def get_video_content(video_url):
     try:
-        # 簡易抓取 Video ID
         if "v=" in video_url:
             video_id = video_url.split("v=")[-1].split("&")[0]
         elif "youtu.be" in video_url:
@@ -30,81 +78,81 @@ def get_video_content(video_url):
         else:
             return "錯誤", "無法辨識網址"
 
-        # --- 策略 A: 超強效字幕抓取 (修正版) ---
+        full_text = None
+        source_type = "未知"
+
+        # --- 第一關：正規軍 (youtube-transcript-api) ---
         try:
-            print(f"嘗試抓取字幕: {video_id}")
-            # 1. 取得該影片所有可用的字幕列表
+            print(f"嘗試正規字幕抓取: {video_id}")
             transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            
-            # 2. 嘗試搜尋中文 (各種變體) 或 英文
-            # 這裡會自動包含「自動產生」的字幕，不會因為沒人手打字幕就失敗
+            transcript = transcript_list.find_transcript(['zh-TW', 'zh-Hant', 'zh', 'zh-CN', 'en'])
+            full_text = " ".join([i['text'] for i in transcript.fetch()])
+            source_type = "CC字幕(直連)"
+        except Exception:
+            print("正規抓取失敗，準備切換替身模式...")
+
+        # --- 第二關：替身攻擊 (Piped API) ---
+        # 如果第一關失敗 (被封鎖或沒字幕)，走這條路
+        if not full_text:
+            proxy_text = get_transcript_via_proxy(video_id)
+            if proxy_text:
+                full_text = proxy_text
+                source_type = "CC字幕(替身)"
+
+        # --- 第三關：語音轉錄 (最後手段) ---
+        # 如果連替身都抓不到字幕 (代表真的沒字幕)，才冒險用下載的
+        if not full_text:
             try:
-                transcript = transcript_list.find_transcript(['zh-TW', 'zh-Hant', 'zh', 'zh-CN', 'zh-Hans', 'en'])
-            except:
-                # 3. 如果真的都沒有，就抓「列表中的第一個」 (不管哪國語言，先抓再說)
-                print("找不到指定語言，嘗試抓取任意可用字幕...")
-                transcript = list(transcript_list)[0]
+                print("無字幕，嘗試語音轉錄...")
+                # 這裡可能會失敗，但已經是最後一招了
+                ydl_opts = {
+                    'format': 'bestaudio[ext=m4a]/bestaudio', 
+                    'outtmpl': '/tmp/%(id)s.%(ext)s',
+                    'noplaylist': True,
+                    # 偽裝 User Agent
+                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                }
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(video_url, download=True)
+                    filename = ydl.prepare_filename(info)
+                
+                with open(filename, "rb") as file:
+                    transcription = groq_client.audio.transcriptions.create(
+                        file=(filename, file.read()),
+                        model="whisper-large-v3",
+                        response_format="text"
+                    )
+                if os.path.exists(filename): os.remove(filename)
+                full_text = transcription
+                source_type = "語音轉錄"
+            except Exception as e:
+                return "錯誤", f"所有方法都失敗 (IP 被封鎖且無替代字幕): {str(e)}"
 
-            # 4. 下載並格式化
-            text_data = transcript.fetch()
-            full_text = " ".join([i['text'] for i in text_data])
-            
-            return "CC字幕", full_text
-
-        except Exception as e:
-            print(f"字幕抓取完全失敗，原因: {e}")
-            # 只有在真的連「自動產生字幕」都沒有時，才進入策略 B
-
-        # --- 策略 B: 語音轉錄 (僅當作最後手段) ---
-        # 注意：在免費雲端主機上，這一步容易被 YouTube 阻擋 (HTTP 429/Sign in required)
-        ydl_opts = {
-            'format': 'bestaudio[ext=m4a]/bestaudio', 
-            'outtmpl': '/tmp/%(id)s.%(ext)s',
-            'noplaylist': True,
-            # 嘗試偽裝成瀏覽器 User Agent 以降低被擋機率
-            'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-        }
-        
-        with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-            info = ydl.extract_info(video_url, download=True)
-            filename = ydl.prepare_filename(info)
-        
-        # 呼叫 Groq 轉錄
-        with open(filename, "rb") as file:
-            transcription = groq_client.audio.transcriptions.create(
-                file=(filename, file.read()),
-                model="whisper-large-v3",
-                response_format="text"
-            )
-        
-        if os.path.exists(filename):
-            os.remove(filename)
-            
-        return "語音轉錄", transcription
+        return source_type, full_text
 
     except Exception as e:
-        return "錯誤", f"無法處理此影片 (可能無字幕且 YouTube 阻擋下載): {str(e)}"
+        return "錯誤", str(e)
 
 # 核心功能：寫文章
 def summarize_text(text):
     model = genai.GenerativeModel('gemini-1.5-flash')
-    # 這裡稍微修改 Prompt，讓 AI 知道如果是英文或亂碼要翻譯
     prompt = f"""
-    你是一位專業主編。請閱讀以下影片逐字稿（可能是語音辨識結果或自動字幕），並用「繁體中文」寫成一篇重點懶人包。
+    你是一位專業主編。請閱讀以下影片內容（可能包含時間軸雜訊），並用「繁體中文」寫成一篇重點懶人包。
     
     要求：
     1. 標題要吸睛。
     2. 結構包含：【前言】、【核心重點摘要】(條列式)、【結論】。
-    3. 若原文是外語，請直接翻譯並整合。
+    3. 若原文是外語，請直接翻譯。
+    4. 忽略內容中的時間碼 (如 00:01:23)。
     
     內容：
-    {text[:25000]}
+    {text[:30000]}
     """
     try:
         response = model.generate_content(prompt)
         return response.text
     except:
-        return "AI 生成文章失敗，可能是內容過長或含有敏感詞。"
+        return "AI 生成文章失敗 (內容過長或敏感)。"
 
 @app.route("/callback", methods=['POST'])
 def callback():
@@ -122,7 +170,7 @@ def handle_message(event):
     user_id = event.source.user_id
     
     if "youtube.com" in msg or "youtu.be" in msg:
-        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！正在分析影片 (約需 15~30 秒)..."))
+        line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！正在啟動多重路徑分析影片..."))
         
         source, content = get_video_content(msg)
         

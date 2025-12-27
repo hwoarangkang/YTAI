@@ -2,6 +2,7 @@ import os
 import re
 import requests
 import json
+import logging
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -12,7 +13,19 @@ from google.generativeai.types import HarmCategory, HarmBlockThreshold
 from groq import Groq
 import yt_dlp
 
+# --- 設定 Log 顯示 (除錯關鍵) ---
+logging.basicConfig(level=logging.INFO)
+logger = logging.getLogger(__name__)
+
 app = Flask(__name__)
+
+# --- 0. 啟動檢查：印出套件版本 (確認伺服器是否更新) ---
+try:
+    import importlib.metadata
+    genai_version = importlib.metadata.version("google-generativeai")
+    logger.info(f"🔥🔥🔥 目前 Google AI 套件版本: {genai_version} (目標: >=0.8.3) 🔥🔥🔥")
+except:
+    logger.info("無法偵測套件版本")
 
 # --- 1. 設定 API 金鑰 ---
 line_bot_api = LineBotApi(os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
@@ -20,7 +33,7 @@ handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
 groq_client = Groq(api_key=os.environ.get('GROQ_API_KEY'))
 
-# --- 2. 設定 Gemini 安全過濾 (全開防止被擋) ---
+# --- 2. 設定 Gemini 安全過濾 ---
 safety_settings = {
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -28,7 +41,7 @@ safety_settings = {
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
 }
 
-# --- 3. 定義 Piped 替身伺服器 (繞過 YouTube 封鎖用) ---
+# --- 3. Piped 替身伺服器清單 ---
 PIPED_INSTANCES = [
     "https://pipedapi.kavin.rocks",
     "https://api.piped.privacy.com.de",
@@ -38,25 +51,20 @@ PIPED_INSTANCES = [
     "https://api.piped.yt"
 ]
 
-# --- 輔助功能：透過 Piped 抓字幕 ---
+# --- 輔助功能：Piped 字幕抓取 ---
 def get_transcript_via_piped(video_id):
     for instance in PIPED_INSTANCES:
         try:
-            print(f"正在嘗試替身伺服器: {instance} ...")
+            logger.info(f"嘗試替身: {instance}")
             url = f"{instance}/streams/{video_id}"
             response = requests.get(url, timeout=5)
-            
             if response.status_code != 200: continue
-                
             data = response.json()
             subtitles = data.get('subtitles', [])
-            
             if not subtitles: continue
 
             target_sub = None
-            # 優先順序：繁中 -> 簡中 -> 英文
             priority_langs = ['zh-TW', 'zh-Hant', 'zh', 'zh-CN', 'en']
-            
             for lang in priority_langs:
                 for sub in subtitles:
                     if lang in sub.get('code', ''):
@@ -64,33 +72,23 @@ def get_transcript_via_piped(video_id):
                         break
                 if target_sub: break
             
-            # 若無指定語言，抓第一個
-            if not target_sub and subtitles:
-                target_sub = subtitles[0]
+            if not target_sub and subtitles: target_sub = subtitles[0]
 
             if target_sub:
-                print(f"成功從 {instance} 抓到字幕")
+                logger.info(f"成功從 {instance} 抓到字幕")
                 sub_text = requests.get(target_sub['url']).text
-                
-                # 清理 VTT 格式雜訊
                 clean_text = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}', '', sub_text)
                 clean_text = re.sub(r'<[^>]+>', '', clean_text) 
                 clean_text = re.sub(r'WEBVTT|Kind: captions|Language: .*', '', clean_text)
-                
-                # 去除重複行並合併
                 lines = [line.strip() for line in clean_text.split('\n') if line.strip()]
                 return " ".join(list(dict.fromkeys(lines)))
-
-        except Exception as e:
-            # print(f"{instance} 連線失敗: {e}") # 減少 log 雜訊
+        except Exception:
             continue
-            
     return None
 
-# --- 4. 核心功能：分析影片 (多重策略) ---
+# --- 4. 核心功能：分析影片 ---
 def get_video_content(video_url):
     try:
-        # 解析 Video ID
         if "v=" in video_url:
             video_id = video_url.split("v=")[-1].split("&")[0]
         elif "youtu.be" in video_url:
@@ -101,33 +99,30 @@ def get_video_content(video_url):
         full_text = None
         source_type = "未知"
 
-        # [策略 A] 正規軍 (YouTubeTranscriptApi)
+        # 策略 A
         try:
-            print("策略 A: 正規抓取")
             transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
-            transcript = list(transcript_list)[0] 
+            transcript = list(transcript_list)[0]
             full_text = " ".join([i['text'] for i in transcript.fetch()])
             source_type = "CC字幕(官方)"
-        except Exception:
-            print("正規抓取失敗，切換策略 B...")
+        except:
+            pass
 
-        # [策略 B] 替身軍團 (Piped API)
+        # 策略 B
         if not full_text:
-            print("策略 B: 啟動多重替身輪詢")
             proxy_text = get_transcript_via_piped(video_id)
             if proxy_text:
                 full_text = proxy_text
                 source_type = "CC字幕(替身)"
 
-        # [策略 C] 下載音訊轉錄 (Groq)
+        # 策略 C
         if not full_text:
             try:
-                print("策略 C: 嘗試語音轉錄 (Groq)...")
                 ydl_opts = {
                     'format': 'bestaudio[ext=m4a]/bestaudio', 
                     'outtmpl': '/tmp/%(id)s.%(ext)s',
                     'noplaylist': True,
-                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                    'user_agent': 'Mozilla/5.0',
                 }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(video_url, download=True)
@@ -143,52 +138,49 @@ def get_video_content(video_url):
                 full_text = transcription
                 source_type = "語音轉錄(Groq)"
             except Exception as e:
-                return "失敗", f"所有方法失效: {str(e)}"
+                return "失敗", f"無字幕且轉錄失敗: {str(e)}"
 
         return source_type, full_text
-
     except Exception as e:
         return "錯誤", str(e)
 
-# --- 5. 核心功能：AI 寫文章 (不死鳥重試版) ---
+# --- 5. 核心功能：AI 寫文章 (究極容錯版) ---
 def summarize_text(text):
     prompt = f"""
     你是一位專業主編。請閱讀以下影片內容，用「繁體中文」撰寫一篇重點懶人包。
-    
-    【要求】
-    1. 標題：吸睛且精準。
-    2. 結構：前言、核心重點（條列式）、結論。
-    3. 語氣：通順流暢，去除逐字稿的口語贅字。
-    
     【內容】
     {text[:30000]}
     """
 
-    # 定義模型優先順序 (解決 404 問題的關鍵)
-    # 我們嘗試各種可能的名稱，直到一個成功為止
+    # 依照順序嘗試：最新版 -> 穩定版 -> 舊版 -> 古老版(1.0)
     priority_models = [
-        "gemini-2.0-flash-exp",    # 1. 最強最新版 (即 2.5 預覽)
-        "gemini-1.5-flash",        # 2. 標準 Flash
-        "gemini-1.5-flash-002",    # 3. 指定版號 Flash (最穩)
-        "gemini-1.5-pro",          # 4. Pro 版 (備援)
-        "gemini-1.5-pro-002"       # 5. 指定版號 Pro
+        "gemini-2.0-flash-exp", 
+        "gemini-1.5-flash",
+        "gemini-1.5-flash-002",
+        "gemini-1.5-pro",
+        "gemini-pro" # 這是 1.0 版，如果前面都死光，這個通常還活著
     ]
 
     last_error = ""
 
     for model_name in priority_models:
         try:
-            print(f"正在嘗試 AI 模型: {model_name} ...")
+            logger.info(f"正在呼叫 AI 模型: {model_name} ...")
             model = genai.GenerativeModel(model_name)
             response = model.generate_content(prompt, safety_settings=safety_settings)
-            return response.text # 成功就回傳
+            return response.text
         except Exception as e:
-            print(f"模型 {model_name} 失敗，自動切換下一個... (錯誤: {str(e)})")
-            last_error = str(e)
-            continue # 失敗就跑下一個迴圈
+            error_msg = str(e)
+            logger.error(f"模型 {model_name} 失敗: {error_msg}")
+            
+            # 如果是 404，代表 API 版本太舊或模型名稱錯誤
+            if "404" in error_msg:
+                last_error = f"404 Not Found (請在 Render 執行 Clear Cache & Deploy)"
+            else:
+                last_error = error_msg
+            continue
 
-    # 如果跑完 5 個都失敗，才回傳錯誤
-    return f"AI 生成失敗 (所有模型皆嘗試過，請檢查 API Key 配額): {last_error}"
+    return f"AI 全部失敗。原因: {last_error}"
 
 # --- 6. LINE Webhook ---
 @app.route("/callback", methods=['POST'])
@@ -208,7 +200,7 @@ def handle_message(event):
     
     if "youtube.com" in msg or "youtu.be" in msg:
         try:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！正在啟動多重路徑分析影片 (約需 20~60 秒)..."))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 分析運算中..."))
         except: pass
 
         source, content = get_video_content(msg)
@@ -217,12 +209,11 @@ def handle_message(event):
             result_msg = f"❌ {content}"
         else:
             summary = summarize_text(content)
-            result_msg = f"✅ 分析完成 (來源: {source})\n\n{summary}"
+            result_msg = f"✅ 完成 ({source})\n\n{summary}"
         
         try:
             line_bot_api.push_message(user_id, TextSendMessage(text=result_msg))
-        except Exception as e:
-            print(f"Push error: {e}")
+        except: pass
 
 if __name__ == "__main__":
     app.run()

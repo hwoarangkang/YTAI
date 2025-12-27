@@ -97,20 +97,20 @@ def download_via_invidious(video_id):
         except: continue
     return None
 
-# --- Cookie 處理器 (關鍵核心) ---
+# --- Cookie 處理器 (讀取 Render 環境變數) ---
 def create_cookie_file():
-    # 從 Render 環境變數讀取你的 Cookie 內容
+    # 這裡會讀取你在 Render 設定的 YOUTUBE_COOKIES
     cookie_content = os.environ.get('YOUTUBE_COOKIES')
     if not cookie_content:
-        logger.warning("⚠️ 未偵測到 YOUTUBE_COOKIES，將嘗試裸連...")
+        logger.warning("⚠️ 警告：找不到 YOUTUBE_COOKIES 環境變數！")
         return None
     
     try:
-        # 建立一個暫存檔，把 Cookie 寫進去
+        # 建立暫存檔 (因為 yt-dlp 需要檔案路徑)
         fd, path = tempfile.mkstemp(suffix='.txt', text=True)
         with os.fdopen(fd, 'w') as f:
             f.write(cookie_content)
-        logger.info(f"🍪 Cookie 憑證已掛載: {path}")
+        logger.info(f"🍪 Cookie 憑證已成功掛載至暫存區: {path}")
         return path
     except Exception as e:
         logger.error(f"Cookie 建立失敗: {e}")
@@ -137,7 +137,7 @@ def get_video_content(video_url):
             source_type = "CC字幕(官方)"
         except: pass
 
-        # [策略 B] yt-dlp (Cookie 核彈模式 - 優先嘗試)
+        # [策略 B] yt-dlp (Cookie 驗證模式 - 最強主力)
         if not full_text:
             logger.info("啟動策略 B: yt-dlp (Cookie 驗證模式)...")
             cookie_path = create_cookie_file()
@@ -152,11 +152,10 @@ def get_video_content(video_url):
                 'nocheckcertificate': True
             }
             
-            # 如果有 Cookie 檔案，就餵給 yt-dlp
             if cookie_path:
                 ydl_opts['cookiefile'] = cookie_path
             else:
-                # 沒 Cookie 才會用 Android 偽裝 (效果較差)
+                # 沒 Cookie 才用 Android 偽裝
                 ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android']}}
 
             try:
@@ -166,7 +165,7 @@ def get_video_content(video_url):
                     if info: filename = ydl.prepare_filename(info)
                 
                 if filename and os.path.exists(filename):
-                    if os.path.getsize(filename) > 10240:
+                    if os.path.getsize(filename) > 10240: # 確保檔案大於 10KB
                         with open(filename, "rb") as file:
                             transcription = groq_client.audio.transcriptions.create(
                                 file=(filename, file.read()), model="whisper-large-v3", response_format="text"
@@ -177,11 +176,11 @@ def get_video_content(video_url):
             except Exception as e:
                 logger.error(f"yt-dlp 失敗: {e}")
             finally:
-                # 用完把暫存檔刪掉
+                # 重要：用完把暫存檔刪掉，保持乾淨
                 if cookie_path and os.path.exists(cookie_path):
                     os.remove(cookie_path)
 
-        # [策略 C] Invidious (備援)
+        # [策略 C] Invidious 替身 (備援)
         if not full_text:
             logger.info("啟動策略 C: Invidious 替身下載...")
             audio_file = download_via_invidious(video_id)
@@ -200,7 +199,7 @@ def get_video_content(video_url):
                     logger.error(f"Groq 轉錄失敗: {e}")
 
         if not full_text:
-            return "失敗", "所有方法皆失效。請確認 Cookie 是否過期，或影片是否有版權限制。"
+            return "失敗", "所有方法皆失效。YouTube 封鎖了伺服器連線。"
 
         return source_type, full_text
     except Exception as e:
@@ -284,7 +283,7 @@ def handle_message(event):
     
     if "youtube.com" in msg or "youtu.be" in msg:
         try:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！正在使用 Cookie 通行證讀取影片..."))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！驗證身份中，請稍候..."))
         except: pass
 
         thread = threading.Thread(target=process_video_task, args=(user_id, event.reply_token, msg))

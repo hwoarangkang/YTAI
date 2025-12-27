@@ -45,22 +45,39 @@ safety_settings = {
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
 }
 
-# --- 3. Piped 替身伺服器 (已調整順序，踢掉不穩的 kavin) ---
+# --- 3. Piped 替身伺服器軍團 (人海戰術版) ---
+# 包含全球各地的主機，防止單一來源被封鎖
 PIPED_INSTANCES = [
-    "https://pipedapi.tokhmi.xyz",       # 目前較穩
-    "https://pipedapi.moomoo.me",        # 備用 1
-    "https://api.piped.projectsegfau.lt",# 備用 2
-    "https://api.piped.privacy.com.de",  # 備用 3
-    "https://api.piped.yt",              # 官方 (容易限流)
-    "https://pipedapi.kavin.rocks"       # 容易 502，移到最後
+    "https://pipedapi.kavin.rocks",
+    "https://api.piped.privacy.com.de",
+    "https://api.piped.projectsegfau.lt",
+    "https://pipedapi.tokhmi.xyz",
+    "https://pipedapi.moomoo.me",
+    "https://api.piped.yt",
+    "https://pipedapi.systemless.io",
+    "https://pipedapi.smnz.de",
+    "https://pipedapi.adminforge.de",
+    "https://pipedapi.drgns.space",
+    "https://pipedapi.ducks.party",
+    "https://pipedapi.lunar.icu",
+    "https://pipedapi.r4fo.com",
+    "https://pipedapi.frontendfriendly.xyz",
+    "https://pipedapi.kavin.rocks", 
+    "https://api.piped.mha.fi",
+    "https://api.piped.chalios.xyz",
+    "https://api.piped.leptons.xyz"
 ]
 
 def get_transcript_via_piped(video_id):
-    for instance in PIPED_INSTANCES:
+    # 關鍵策略：每次都隨機洗牌，避免死守同一個壞掉的伺服器
+    instances = PIPED_INSTANCES.copy()
+    random.shuffle(instances)
+
+    for instance in instances:
         try:
-            # logger.info(f"嘗試替身: {instance}") # 減少 log
+            # 設定短超時，快速輪詢
             url = f"{instance}/streams/{video_id}"
-            response = requests.get(url, timeout=5)
+            response = requests.get(url, timeout=4) 
             
             if response.status_code != 200: continue
             
@@ -82,24 +99,22 @@ def get_transcript_via_piped(video_id):
             if target_sub:
                 sub_text = requests.get(target_sub['url'], timeout=5).text
                 
-                # 🔥 關鍵修正：檢查抓回來的內容是不是「錯誤網頁」 🔥
+                # 防火牆：檢查是否抓到錯誤頁面
                 if "<!DOCTYPE html>" in sub_text or "Bad Gateway" in sub_text or "Cloudflare" in sub_text:
-                    logger.warning(f"⚠️ {instance} 回傳了錯誤頁面 (502/Cloudflare)，跳過...")
                     continue
 
-                # 清理 VTT 格式
                 clean_text = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}', '', sub_text)
                 clean_text = re.sub(r'<[^>]+>', '', clean_text) 
                 clean_text = re.sub(r'WEBVTT|Kind: captions|Language: .*', '', clean_text)
                 lines = [line.strip() for line in clean_text.split('\n') if line.strip()]
                 
                 final_text = " ".join(list(dict.fromkeys(lines)))
-                if len(final_text) < 50: # 如果字幕太短也不對勁
-                    continue
+                if len(final_text) < 50: continue # 太短也不要
                     
+                logger.info(f"✅ 成功從替身 {instance} 抓取字幕")
                 return final_text
 
-        except Exception as e:
+        except Exception:
             continue
             
     return None
@@ -117,7 +132,7 @@ def get_video_content(video_url):
         full_text = None
         source_type = "未知"
 
-        # 策略 A: 官方 API
+        # 策略 A: 官方 API (容易被 Render IP 封鎖，但先試試)
         try:
             transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
             transcript = list(transcript_list)[0]
@@ -125,17 +140,23 @@ def get_video_content(video_url):
             source_type = "CC字幕(官方)"
         except: pass
 
-        # 策略 B: Piped 替身
+        # 策略 B: Piped 替身軍團 (主力部隊)
         if not full_text:
             proxy_text = get_transcript_via_piped(video_id)
             if proxy_text:
                 full_text = proxy_text
                 source_type = "CC字幕(替身)"
 
-        # 策略 C: Groq 語音轉錄
+        # 策略 C: Groq 語音轉錄 (最後手段，但 Render IP 容易被擋)
         if not full_text:
             try:
-                ydl_opts = {'format': 'bestaudio[ext=m4a]/bestaudio', 'outtmpl': '/tmp/%(id)s.%(ext)s', 'noplaylist': True}
+                ydl_opts = {
+                    'format': 'bestaudio[ext=m4a]/bestaudio', 
+                    'outtmpl': '/tmp/%(id)s.%(ext)s', 
+                    'noplaylist': True,
+                    # 嘗試模擬瀏覽器 User Agent
+                    'user_agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36'
+                }
                 with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                     info = ydl.extract_info(video_url, download=True)
                     filename = ydl.prepare_filename(info)
@@ -147,7 +168,10 @@ def get_video_content(video_url):
                 full_text = transcription
                 source_type = "語音轉錄(Groq)"
             except Exception as e:
-                return "失敗", f"無字幕且轉錄失敗: {str(e)}"
+                error_msg = str(e)
+                if "Sign in" in error_msg:
+                    return "失敗", "YouTube 拒絕了伺服器連線 (Bot Detection)，且所有替身網站皆忙線中。請稍後再試。"
+                return "失敗", f"無法取得字幕或音訊: {error_msg}"
 
         return source_type, full_text
     except Exception as e:
@@ -215,7 +239,7 @@ def handle_message(event):
     user_id = event.source.user_id
     if "youtube.com" in msg or "youtu.be" in msg:
         try:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！多核心 AI 分析中..."))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！正在調度全球節點下載影片..."))
         except: pass
         source, content = get_video_content(msg)
         if source == "失敗" or source == "錯誤":

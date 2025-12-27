@@ -74,6 +74,7 @@ def download_via_invidious(video_id):
             
             audio_url = None
             for fmt in data['adaptiveFormats']:
+                # 優先找 audio/webm (通常比較小)
                 if 'audio' in fmt.get('type', ''):
                     audio_url = fmt.get('url')
                     break
@@ -97,20 +98,18 @@ def download_via_invidious(video_id):
         except: continue
     return None
 
-# --- Cookie 處理器 (讀取 Render 環境變數) ---
+# --- Cookie 處理器 ---
 def create_cookie_file():
-    # 這裡會讀取你在 Render 設定的 YOUTUBE_COOKIES
     cookie_content = os.environ.get('YOUTUBE_COOKIES')
     if not cookie_content:
-        logger.warning("⚠️ 警告：找不到 YOUTUBE_COOKIES 環境變數！")
+        logger.warning("⚠️ 未偵測到 YOUTUBE_COOKIES，將嘗試裸連...")
         return None
     
     try:
-        # 建立暫存檔 (因為 yt-dlp 需要檔案路徑)
         fd, path = tempfile.mkstemp(suffix='.txt', text=True)
         with os.fdopen(fd, 'w') as f:
             f.write(cookie_content)
-        logger.info(f"🍪 Cookie 憑證已成功掛載至暫存區: {path}")
+        logger.info(f"🍪 Cookie 憑證已掛載: {path}")
         return path
     except Exception as e:
         logger.error(f"Cookie 建立失敗: {e}")
@@ -137,13 +136,15 @@ def get_video_content(video_url):
             source_type = "CC字幕(官方)"
         except: pass
 
-        # [策略 B] yt-dlp (Cookie 驗證模式 - 最強主力)
+        # [策略 B] yt-dlp (Cookie 驗證 + 瘦身模式)
         if not full_text:
-            logger.info("啟動策略 B: yt-dlp (Cookie 驗證模式)...")
+            logger.info("啟動策略 B: yt-dlp (Cookie/瘦身模式)...")
             cookie_path = create_cookie_file()
             
             ydl_opts = {
-                'format': 'bestaudio/best', 
+                # 🔥 關鍵修改：只抓最差音質 (worstaudio) 以減少檔案大小
+                # Groq 限制 25MB，這招通常能把 100MB 壓到 20MB 以下
+                'format': 'worstaudio/worst', 
                 'outtmpl': '/tmp/%(id)s.%(ext)s',
                 'noplaylist': True,
                 'quiet': True,
@@ -155,7 +156,6 @@ def get_video_content(video_url):
             if cookie_path:
                 ydl_opts['cookiefile'] = cookie_path
             else:
-                # 沒 Cookie 才用 Android 偽裝
                 ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android']}}
 
             try:
@@ -165,18 +165,23 @@ def get_video_content(video_url):
                     if info: filename = ydl.prepare_filename(info)
                 
                 if filename and os.path.exists(filename):
-                    if os.path.getsize(filename) > 10240: # 確保檔案大於 10KB
+                    file_size = os.path.getsize(filename)
+                    # 🔥 安全檢查：如果檔案還是超過 25MB，直接放棄避免報錯
+                    if file_size > 26214400: # 25MB in bytes
+                        logger.error(f"❌ 檔案過大 ({file_size / 1024 / 1024:.2f} MB)，Groq 無法處理")
+                        os.remove(filename)
+                        # 這裡不 return，讓它繼續嘗試下一個策略(如果有)或報錯
+                    elif file_size > 10240:
                         with open(filename, "rb") as file:
                             transcription = groq_client.audio.transcriptions.create(
                                 file=(filename, file.read()), model="whisper-large-v3", response_format="text"
                             )
                         full_text = transcription
                         source_type = "語音轉錄(yt-dlp)"
-                    if os.path.exists(filename): os.remove(filename)
+                        if os.path.exists(filename): os.remove(filename)
             except Exception as e:
                 logger.error(f"yt-dlp 失敗: {e}")
             finally:
-                # 重要：用完把暫存檔刪掉，保持乾淨
                 if cookie_path and os.path.exists(cookie_path):
                     os.remove(cookie_path)
 
@@ -185,21 +190,26 @@ def get_video_content(video_url):
             logger.info("啟動策略 C: Invidious 替身下載...")
             audio_file = download_via_invidious(video_id)
             if audio_file:
-                try:
-                    with open(audio_file, "rb") as file:
-                        transcription = groq_client.audio.transcriptions.create(
-                            file=(audio_file, file.read()), 
-                            model="whisper-large-v3", 
-                            response_format="text"
-                        )
-                    full_text = transcription
-                    source_type = "語音轉錄(Invidious)"
-                    if os.path.exists(audio_file): os.remove(audio_file)
-                except Exception as e:
-                    logger.error(f"Groq 轉錄失敗: {e}")
+                # 同樣檢查大小
+                if os.path.getsize(audio_file) > 26214400:
+                     logger.error("❌ Invidious 檔案過大，跳過")
+                     os.remove(audio_file)
+                else:
+                    try:
+                        with open(audio_file, "rb") as file:
+                            transcription = groq_client.audio.transcriptions.create(
+                                file=(audio_file, file.read()), 
+                                model="whisper-large-v3", 
+                                response_format="text"
+                            )
+                        full_text = transcription
+                        source_type = "語音轉錄(Invidious)"
+                        if os.path.exists(audio_file): os.remove(audio_file)
+                    except Exception as e:
+                        logger.error(f"Groq 轉錄失敗: {e}")
 
         if not full_text:
-            return "失敗", "所有方法皆失效。YouTube 封鎖了伺服器連線。"
+            return "失敗", "無法下載內容，或影片音訊檔超過 25MB (Groq 限制)。"
 
         return source_type, full_text
     except Exception as e:
@@ -283,7 +293,7 @@ def handle_message(event):
     
     if "youtube.com" in msg or "youtu.be" in msg:
         try:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！驗證身份中，請稍候..."))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！正在以「節省流量模式」讀取影片..."))
         except: pass
 
         thread = threading.Thread(target=process_video_task, args=(user_id, event.reply_token, msg))

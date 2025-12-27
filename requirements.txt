@@ -2,7 +2,7 @@ flask
 line-bot-sdk
 youtube-transcript-api
 requests
-google-generativeai
+google-generativeai>=0.8.3
 groq
 yt-dlp
 gunicorn

@@ -5,3 +5,4 @@ youtube-transcript-api
 yt-dlp
 gunicorn
 requests
+groq

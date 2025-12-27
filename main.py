@@ -4,7 +4,8 @@ import requests
 import json
 import logging
 import random
-import threading  # <--- 新增：多執行緒模組，用來跑背景任務
+import threading
+import time
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -21,7 +22,7 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# --- 1. 設定 API 金鑰庫 (安全讀取版) ---
+# --- 1. 設定 API 金鑰庫 ---
 raw_keys = [
     os.environ.get('GEMINI_API_KEY_1'),
     os.environ.get('GEMINI_API_KEY_2'),
@@ -46,7 +47,7 @@ safety_settings = {
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
 }
 
-# --- 3. Piped 替身伺服器軍團 ---
+# --- 3. Piped 替身伺服器 (精選優質節點，移除地雷) ---
 PIPED_INSTANCES = [
     "https://pipedapi.tokhmi.xyz", 
     "https://api.piped.privacy.com.de",
@@ -57,15 +58,19 @@ PIPED_INSTANCES = [
     "https://pipedapi.adminforge.de",
     "https://pipedapi.drgns.space",
     "https://pipedapi.ducks.party",
-    "https://pipedapi.lunar.icu",
     "https://pipedapi.r4fo.com",
     "https://pipedapi.frontendfriendly.xyz",
     "https://api.piped.mha.fi",
     "https://api.piped.chalios.xyz",
-    "https://api.piped.leptons.xyz",
-    "https://pipedapi.kavin.rocks", # 這家最近很慢，移到最後面
-    "https://api.piped.yt"
+    "https://api.piped.leptons.xyz"
 ]
+
+# 偽裝成瀏覽器的 Header (關鍵！防止被 Piped 拒絕)
+FAKE_HEADERS = {
+    'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+    'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
+    'Referer': 'https://www.google.com/'
+}
 
 def get_transcript_via_piped(video_id):
     instances = PIPED_INSTANCES.copy()
@@ -74,8 +79,8 @@ def get_transcript_via_piped(video_id):
     for instance in instances:
         try:
             url = f"{instance}/streams/{video_id}"
-            # 設定短超時 (3秒)，遇到慢的直接跳過，不要等
-            response = requests.get(url, timeout=3) 
+            # 加入 headers 偽裝
+            response = requests.get(url, headers=FAKE_HEADERS, timeout=3) 
             if response.status_code != 200: continue
             
             data = response.json()
@@ -94,8 +99,8 @@ def get_transcript_via_piped(video_id):
             if not target_sub and subtitles: target_sub = subtitles[0]
 
             if target_sub:
-                sub_text = requests.get(target_sub['url'], timeout=5).text
-                # 檢查是否為錯誤網頁
+                sub_text = requests.get(target_sub['url'], headers=FAKE_HEADERS, timeout=5).text
+                
                 if "<!DOCTYPE html>" in sub_text or "Bad Gateway" in sub_text or "Cloudflare" in sub_text:
                     continue
 
@@ -111,7 +116,6 @@ def get_transcript_via_piped(video_id):
             continue
     return None
 
-# Piped 音訊下載 (背景執行時不會卡死主程式)
 def download_audio_via_piped(video_id):
     instances = PIPED_INSTANCES.copy()
     random.shuffle(instances)
@@ -119,29 +123,43 @@ def download_audio_via_piped(video_id):
     for instance in instances:
         try:
             url = f"{instance}/streams/{video_id}"
-            resp = requests.get(url, timeout=4)
+            # 1. 取得資訊 (加入偽裝 Headers)
+            resp = requests.get(url, headers=FAKE_HEADERS, timeout=4)
             if resp.status_code != 200: continue
             
             data = resp.json()
             audio_streams = data.get('audioStreams', [])
             if not audio_streams: continue
             
-            target_audio = audio_streams[0]
+            # 優先找 m4a 格式
+            target_audio = next((s for s in audio_streams if s.get('format') == 'm4a'), audio_streams[0])
             audio_url = target_audio['url']
             
             logger.info(f"🎵 正在從 {instance} 下載音訊...")
             
-            # 使用 stream=True 避免記憶體爆掉
-            audio_resp = requests.get(audio_url, stream=True, timeout=15)
+            # 2. 下載檔案 (加入偽裝 Headers + Stream)
+            audio_resp = requests.get(audio_url, headers=FAKE_HEADERS, stream=True, timeout=15)
             if audio_resp.status_code != 200: continue
 
             filename = f"/tmp/{video_id}.mp3"
+            
+            # 3. 寫入檔案並檢查大小
+            downloaded_size = 0
             with open(filename, 'wb') as f:
                 for chunk in audio_resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
+                    if chunk:
+                        f.write(chunk)
+                        downloaded_size += len(chunk)
+            
+            # 🔥 關鍵檢查：如果檔案小於 10KB，絕對是假檔案/錯誤頁面，重試下一個
+            if downloaded_size < 10240: 
+                logger.warning(f"⚠️ {instance} 下載的檔案太小 ({downloaded_size} bytes)，視為失敗。")
+                if os.path.exists(filename): os.remove(filename)
+                continue
             
             return filename
-        except Exception:
+        except Exception as e:
+            # logger.warning(f"Piped Audio Error: {e}")
             continue
     return None
 
@@ -173,9 +191,9 @@ def get_video_content(video_url):
                 full_text = proxy_text
                 source_type = "CC字幕(替身)"
 
-        # 策略 C: Piped 音訊 + Groq (這是最花時間的步驟，必須在背景跑)
+        # 策略 C: Piped 音訊 + Groq (主要依靠這個)
         if not full_text:
-            logger.info("啟動策略 C: Piped 音訊轉錄...")
+            logger.info("啟動策略 C: Piped 音訊轉錄 (忍者模式)...")
             audio_file = download_audio_via_piped(video_id)
             if audio_file:
                 try:
@@ -191,39 +209,10 @@ def get_video_content(video_url):
                 except Exception as e:
                     logger.error(f"Groq 轉錄失敗: {e}")
 
-        # 策略 D: yt-dlp (最後手段)
+        # 策略 D 已移除：yt-dlp 在 Render 必死無疑，留著只會浪費時間。
+        
         if not full_text:
-            logger.info("啟動策略 D: yt-dlp 下載...")
-            try:
-                ydl_opts = {
-                    'format': 'bestaudio/best', 
-                    'outtmpl': '/tmp/%(id)s.%(ext)s', 
-                    'noplaylist': True,
-                    'quiet': True,
-                    'no_warnings': True,
-                    'ignoreerrors': True, 
-                    'nocheckcertificate': True,
-                    'user_agent': 'Mozilla/5.0'
-                }
-                filename = None
-                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
-                    info = ydl.extract_info(video_url, download=True)
-                    if info:
-                        filename = ydl.prepare_filename(info)
-                
-                if filename and os.path.exists(filename):
-                    with open(filename, "rb") as file:
-                        transcription = groq_client.audio.transcriptions.create(
-                            file=(filename, file.read()), model="whisper-large-v3", response_format="text"
-                        )
-                    if os.path.exists(filename): os.remove(filename)
-                    full_text = transcription
-                    source_type = "語音轉錄(yt-dlp)"
-            except Exception as e:
-                return "失敗", f"所有方法都失敗了: {str(e)}"
-
-        if not full_text:
-            return "失敗", "無法取得字幕或音訊 (影片可能受保護或太長)"
+            return "失敗", "所有替身節點皆忙線或無法存取，請稍後再試。"
 
         return source_type, full_text
     except Exception as e:
@@ -269,11 +258,9 @@ def summarize_text(text):
 
     return f"AI 生成失敗。原因: {last_error}"
 
-# --- 背景任務處理器 (關鍵！防止超時) ---
+# --- 背景任務 ---
 def process_video_task(user_id, reply_token, msg):
-    """這個函式會在背景執行，就算跑 5 分鐘也不會被 Render 殺掉"""
     try:
-        # 執行耗時的下載與分析
         source, content = get_video_content(msg)
         
         if source == "失敗" or source == "錯誤":
@@ -282,7 +269,6 @@ def process_video_task(user_id, reply_token, msg):
             summary = summarize_text(content)
             result_msg = f"✅ 分析完成 ({source})\n\n{summary}"
         
-        # 任務完成後，主動「推播」訊息給使用者 (Push Message)
         line_bot_api.push_message(user_id, TextSendMessage(text=result_msg))
         logger.info(f"✅ 成功推播結果給用戶 {user_id}")
 
@@ -309,14 +295,10 @@ def handle_message(event):
     user_id = event.source.user_id
     
     if "youtube.com" in msg or "youtu.be" in msg:
-        # 1. 先快速回覆 LINE 伺服器，證明我們活著 (避免已讀不回)
         try:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！已啟動背景下載，這可能需要 1~2 分鐘，請稍候..."))
-        except Exception as e:
-            logger.error(f"回覆錯誤: {e}")
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！啟動背景分析 (忍者模式)..."))
+        except: pass
 
-        # 2. 開啟「背景分身」去執行耗時任務
-        # 這樣主程式就能馬上結束回應，不會被 Render 判定超時殺掉
         thread = threading.Thread(target=process_video_task, args=(user_id, event.reply_token, msg))
         thread.start()
 

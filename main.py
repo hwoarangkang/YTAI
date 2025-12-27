@@ -97,20 +97,20 @@ def download_via_invidious(video_id):
         except: continue
     return None
 
-# --- Cookie 處理器 (關鍵！讀取 Render 環境變數) ---
+# --- Cookie 處理器 (關鍵核心) ---
 def create_cookie_file():
+    # 從 Render 環境變數讀取你的 Cookie 內容
     cookie_content = os.environ.get('YOUTUBE_COOKIES')
     if not cookie_content:
-        logger.warning("⚠️ 未偵測到 YOUTUBE_COOKIES 環境變數，將使用無痕模式嘗試...")
+        logger.warning("⚠️ 未偵測到 YOUTUBE_COOKIES，將嘗試裸連...")
         return None
     
     try:
-        # 建立暫存檔給 yt-dlp 讀取
-        # delete=False 確保檔案在 yt-dlp 讀取期間不會被刪除
+        # 建立一個暫存檔，把 Cookie 寫進去
         fd, path = tempfile.mkstemp(suffix='.txt', text=True)
         with os.fdopen(fd, 'w') as f:
             f.write(cookie_content)
-        logger.info(f"🍪 Cookie 檔案已建立: {path}")
+        logger.info(f"🍪 Cookie 憑證已掛載: {path}")
         return path
     except Exception as e:
         logger.error(f"Cookie 建立失敗: {e}")
@@ -138,7 +138,6 @@ def get_video_content(video_url):
         except: pass
 
         # [策略 B] yt-dlp (Cookie 核彈模式 - 優先嘗試)
-        # 因為你有 Cookie，這招成功率最高，所以提到前面來
         if not full_text:
             logger.info("啟動策略 B: yt-dlp (Cookie 驗證模式)...")
             cookie_path = create_cookie_file()
@@ -153,10 +152,11 @@ def get_video_content(video_url):
                 'nocheckcertificate': True
             }
             
+            # 如果有 Cookie 檔案，就餵給 yt-dlp
             if cookie_path:
                 ydl_opts['cookiefile'] = cookie_path
             else:
-                # 沒 Cookie 時嘗試偽裝 Android
+                # 沒 Cookie 才會用 Android 偽裝 (效果較差)
                 ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android']}}
 
             try:
@@ -177,11 +177,11 @@ def get_video_content(video_url):
             except Exception as e:
                 logger.error(f"yt-dlp 失敗: {e}")
             finally:
-                # 清理 cookie 暫存檔
+                # 用完把暫存檔刪掉
                 if cookie_path and os.path.exists(cookie_path):
                     os.remove(cookie_path)
 
-        # [策略 C] Invidious 替身 (備援)
+        # [策略 C] Invidious (備援)
         if not full_text:
             logger.info("啟動策略 C: Invidious 替身下載...")
             audio_file = download_via_invidious(video_id)
@@ -200,7 +200,7 @@ def get_video_content(video_url):
                     logger.error(f"Groq 轉錄失敗: {e}")
 
         if not full_text:
-            return "失敗", "無法下載內容。請確認 YOUTUBE_COOKIES 環境變數是否正確設定。"
+            return "失敗", "所有方法皆失效。請確認 Cookie 是否過期，或影片是否有版權限制。"
 
         return source_type, full_text
     except Exception as e:

@@ -48,63 +48,17 @@ safety_settings = {
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
 }
 
-# --- 3. 替身網路 A: Cobalt (精選穩定節點) ---
-COBALT_INSTANCES = [
-    "https://api.cobalt.tools",
-    "https://cobalt.kwiatekmiki.com",
-    "https://cobalt.q1.pm",
-    "https://cobalt.kinuseka.net",
-    "https://cobalt.wuk.sh"
-]
-
-# --- 4. 替身網路 B: Invidious (新增備援) ---
+# --- 3. 替身網路: Invidious (取代已死的 Cobalt) ---
+# 這些節點通常對下載比較友善
 INVIDIOUS_INSTANCES = [
     "https://inv.tux.pizza",
     "https://vid.puffyan.us",
     "https://invidious.jing.rocks",
     "https://inv.zzls.xyz",
-    "https://invidious.nerdvpn.de"
+    "https://invidious.nerdvpn.de",
+    "https://invidious.privacydev.net",
+    "https://invidious.drgns.space"
 ]
-
-def download_via_cobalt(video_url):
-    instances = COBALT_INSTANCES.copy()
-    random.shuffle(instances)
-    
-    headers = {
-        "Accept": "application/json",
-        "Content-Type": "application/json",
-        "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64)"
-    }
-    payload = {"url": video_url, "videoQuality": "144", "audioFormat": "mp3", "isAudioOnly": True}
-
-    for instance in instances:
-        try:
-            resp = requests.post(f"{instance}/api/json", json=payload, headers=headers, timeout=8)
-            if resp.status_code != 200: continue
-            
-            data = resp.json()
-            if data.get("status") == "error": continue
-            
-            download_url = data.get("url")
-            if not download_url: continue
-            
-            logger.info(f"🎵 Cobalt ({instance}) 取得連結，下載中...")
-            file_resp = requests.get(download_url, stream=True, timeout=20)
-            
-            video_id = video_url.split("v=")[-1].split("&")[0] if "v=" in video_url else "temp"
-            filename = f"/tmp/{video_id}_cob.mp3"
-            
-            with open(filename, 'wb') as f:
-                for chunk in file_resp.iter_content(chunk_size=8192):
-                    f.write(chunk)
-            
-            if os.path.getsize(filename) < 10240: # 檔案太小就是失敗
-                os.remove(filename)
-                continue
-                
-            return filename
-        except: continue
-    return None
 
 def download_via_invidious(video_id):
     instances = INVIDIOUS_INSTANCES.copy()
@@ -112,47 +66,54 @@ def download_via_invidious(video_id):
     
     for instance in instances:
         try:
-            # Invidious API 獲取影片資訊
+            # 1. 呼叫 API 取得影片資訊
             api_url = f"{instance}/api/v1/videos/{video_id}"
-            resp = requests.get(api_url, timeout=5)
+            resp = requests.get(api_url, timeout=6)
             if resp.status_code != 200: continue
             
             data = resp.json()
-            # 尋找音訊串流
+            
+            # 2. 尋找音訊串流 (WebM 或 m4a)
             if 'adaptiveFormats' not in data: continue
             
             audio_url = None
+            # 優先找 audio/webm 或 audio/mp4
             for fmt in data['adaptiveFormats']:
-                if 'audio' in fmt.get('type', '') or fmt.get('container') == 'webm':
+                if 'audio' in fmt.get('type', ''):
                     audio_url = fmt.get('url')
                     break
             
             if not audio_url: continue
             
-            logger.info(f"🎵 Invidious ({instance}) 取得連結，下載中...")
+            logger.info(f"🎵 Invidious ({instance}) 取得音訊連結，下載中...")
+            
+            # 3. 下載檔案
             file_resp = requests.get(audio_url, stream=True, timeout=20)
+            if file_resp.status_code != 200: continue
             
             filename = f"/tmp/{video_id}_inv.mp3"
             with open(filename, 'wb') as f:
                 for chunk in file_resp.iter_content(chunk_size=8192):
                     f.write(chunk)
             
+            # 驗證檔案大小 (小於 10KB 通常是錯誤網頁)
             if os.path.getsize(filename) < 10240:
                 os.remove(filename)
                 continue
                 
             return filename
-        except: continue
+        except Exception:
+            continue
     return None
 
-# --- Cookie 處理器 ---
+# --- Cookie 處理器 (讀取 Render 環境變數) ---
 def create_cookie_file():
     cookie_content = os.environ.get('YOUTUBE_COOKIES')
     if not cookie_content:
         return None
     
-    # 建立暫存 cookie 檔案
     try:
+        # 建立暫存檔給 yt-dlp 讀取
         fd, path = tempfile.mkstemp(suffix='.txt', text=True)
         with os.fdopen(fd, 'w') as f:
             f.write(cookie_content)
@@ -174,7 +135,7 @@ def get_video_content(video_url):
         full_text = None
         source_type = "未知"
 
-        # [策略 A] 官方字幕
+        # [策略 A] 官方字幕 (最快，優先嘗試)
         try:
             transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
             transcript = list(transcript_list)[0]
@@ -182,37 +143,30 @@ def get_video_content(video_url):
             source_type = "CC字幕(官方)"
         except: pass
 
-        # [策略 B] Cobalt
+        # [策略 B] Invidious 替身 (新主力)
+        # 取代 Cobalt，嘗試從 Invidious 網路下載音訊
         if not full_text:
-            audio_file = download_via_cobalt(video_url)
-            if audio_file:
-                try:
-                    with open(audio_file, "rb") as file:
-                        transcription = groq_client.audio.transcriptions.create(
-                            file=(audio_file, file.read()), model="whisper-large-v3", response_format="text"
-                        )
-                    full_text = transcription
-                    source_type = "語音轉錄(Cobalt)"
-                    if os.path.exists(audio_file): os.remove(audio_file)
-                except: pass
-
-        # [策略 C] Invidious (新!)
-        if not full_text:
+            logger.info("啟動策略 B: Invidious 音訊下載...")
             audio_file = download_via_invidious(video_id)
+            
             if audio_file:
                 try:
                     with open(audio_file, "rb") as file:
                         transcription = groq_client.audio.transcriptions.create(
-                            file=(audio_file, file.read()), model="whisper-large-v3", response_format="text"
+                            file=(audio_file, file.read()), 
+                            model="whisper-large-v3", 
+                            response_format="text"
                         )
                     full_text = transcription
                     source_type = "語音轉錄(Invidious)"
                     if os.path.exists(audio_file): os.remove(audio_file)
-                except: pass
+                except Exception as e:
+                    logger.error(f"Groq 轉錄失敗: {e}")
 
-        # [策略 D] yt-dlp (Cookie 核彈模式)
+        # [策略 C] yt-dlp (Cookie 驗證模式 - 最後手段)
+        # 如果你有在 Render 設定 YOUTUBE_COOKIES，這招最強
         if not full_text:
-            logger.info("啟動策略 D: yt-dlp (Cookie 驗證模式)...")
+            logger.info("啟動策略 C: yt-dlp (Cookie 驗證模式)...")
             cookie_path = create_cookie_file()
             
             ydl_opts = {
@@ -225,12 +179,15 @@ def get_video_content(video_url):
                 'nocheckcertificate': True
             }
             
-            # 如果有 Cookie，就掛載上去
             if cookie_path:
                 logger.info("🍪 偵測到 Cookie，已掛載！")
                 ydl_opts['cookiefile'] = cookie_path
             else:
-                logger.warning("⚠️ 未偵測到 Cookie，嘗試裸連 (失敗率高)")
+                logger.warning("⚠️ 未偵測到 Cookie，使用 Android 偽裝模式裸連...")
+                # 如果沒 Cookie，加減用 Android 偽裝試試看
+                ydl_opts['extractor_args'] = {
+                    'youtube': {'player_client': ['android', 'ios']}
+                }
 
             try:
                 filename = None
@@ -239,6 +196,7 @@ def get_video_content(video_url):
                     if info: filename = ydl.prepare_filename(info)
                 
                 if filename and os.path.exists(filename):
+                    # 確保檔案夠大
                     if os.path.getsize(filename) > 10240:
                         with open(filename, "rb") as file:
                             transcription = groq_client.audio.transcriptions.create(
@@ -250,12 +208,11 @@ def get_video_content(video_url):
             except Exception as e:
                 logger.error(f"yt-dlp 失敗: {e}")
             finally:
-                # 清理 cookie 暫存檔
                 if cookie_path and os.path.exists(cookie_path):
                     os.remove(cookie_path)
 
         if not full_text:
-            return "失敗", "所有方法皆失效。請確認影片是否有版權限制，或嘗試在 Render 設定 YOUTUBE_COOKIES。"
+            return "失敗", "所有方法皆失效。YouTube 封鎖了伺服器連線，請嘗試在 Render 設定 YOUTUBE_COOKIES。"
 
         return source_type, full_text
     except Exception as e:
@@ -339,7 +296,7 @@ def handle_message(event):
     
     if "youtube.com" in msg or "youtu.be" in msg:
         try:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！啟動 Cookie 驗證/多重替身分析..."))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！啟動 Invidious/Cookie 驗證模式..."))
         except: pass
 
         thread = threading.Thread(target=process_video_task, args=(user_id, event.reply_token, msg))

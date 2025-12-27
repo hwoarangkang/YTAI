@@ -47,25 +47,19 @@ safety_settings = {
     HarmCategory.HARM_CATEGORY_DANGEROUS_CONTENT: HarmBlockThreshold.BLOCK_NONE,
 }
 
-# --- 3. Piped 替身伺服器 (精選優質節點，移除地雷) ---
+# --- 3. Piped 替身伺服器 (作為最後備援) ---
 PIPED_INSTANCES = [
     "https://pipedapi.tokhmi.xyz", 
     "https://api.piped.privacy.com.de",
     "https://api.piped.projectsegfau.lt",
     "https://pipedapi.moomoo.me",
-    "https://pipedapi.systemless.io",
-    "https://pipedapi.smnz.de",
-    "https://pipedapi.adminforge.de",
     "https://pipedapi.drgns.space",
     "https://pipedapi.ducks.party",
     "https://pipedapi.r4fo.com",
-    "https://pipedapi.frontendfriendly.xyz",
-    "https://api.piped.mha.fi",
     "https://api.piped.chalios.xyz",
     "https://api.piped.leptons.xyz"
 ]
 
-# 偽裝成瀏覽器的 Header (關鍵！防止被 Piped 拒絕)
 FAKE_HEADERS = {
     'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
     'Accept-Language': 'zh-TW,zh;q=0.9,en-US;q=0.8,en;q=0.7',
@@ -79,7 +73,6 @@ def get_transcript_via_piped(video_id):
     for instance in instances:
         try:
             url = f"{instance}/streams/{video_id}"
-            # 加入 headers 偽裝
             response = requests.get(url, headers=FAKE_HEADERS, timeout=3) 
             if response.status_code != 200: continue
             
@@ -100,67 +93,14 @@ def get_transcript_via_piped(video_id):
 
             if target_sub:
                 sub_text = requests.get(target_sub['url'], headers=FAKE_HEADERS, timeout=5).text
-                
-                if "<!DOCTYPE html>" in sub_text or "Bad Gateway" in sub_text or "Cloudflare" in sub_text:
-                    continue
+                if "<!DOCTYPE html>" in sub_text or "Bad Gateway" in sub_text: continue
 
                 clean_text = re.sub(r'\d{2}:\d{2}:\d{2}\.\d{3} --> \d{2}:\d{2}:\d{2}\.\d{3}', '', sub_text)
                 clean_text = re.sub(r'<[^>]+>', '', clean_text) 
                 clean_text = re.sub(r'WEBVTT|Kind: captions|Language: .*', '', clean_text)
                 lines = [line.strip() for line in clean_text.split('\n') if line.strip()]
-                
-                final_text = " ".join(list(dict.fromkeys(lines)))
-                if len(final_text) < 50: continue
-                return final_text
-        except Exception:
-            continue
-    return None
-
-def download_audio_via_piped(video_id):
-    instances = PIPED_INSTANCES.copy()
-    random.shuffle(instances)
-    
-    for instance in instances:
-        try:
-            url = f"{instance}/streams/{video_id}"
-            # 1. 取得資訊 (加入偽裝 Headers)
-            resp = requests.get(url, headers=FAKE_HEADERS, timeout=4)
-            if resp.status_code != 200: continue
-            
-            data = resp.json()
-            audio_streams = data.get('audioStreams', [])
-            if not audio_streams: continue
-            
-            # 優先找 m4a 格式
-            target_audio = next((s for s in audio_streams if s.get('format') == 'm4a'), audio_streams[0])
-            audio_url = target_audio['url']
-            
-            logger.info(f"🎵 正在從 {instance} 下載音訊...")
-            
-            # 2. 下載檔案 (加入偽裝 Headers + Stream)
-            audio_resp = requests.get(audio_url, headers=FAKE_HEADERS, stream=True, timeout=15)
-            if audio_resp.status_code != 200: continue
-
-            filename = f"/tmp/{video_id}.mp3"
-            
-            # 3. 寫入檔案並檢查大小
-            downloaded_size = 0
-            with open(filename, 'wb') as f:
-                for chunk in audio_resp.iter_content(chunk_size=8192):
-                    if chunk:
-                        f.write(chunk)
-                        downloaded_size += len(chunk)
-            
-            # 🔥 關鍵檢查：如果檔案小於 10KB，絕對是假檔案/錯誤頁面，重試下一個
-            if downloaded_size < 10240: 
-                logger.warning(f"⚠️ {instance} 下載的檔案太小 ({downloaded_size} bytes)，視為失敗。")
-                if os.path.exists(filename): os.remove(filename)
-                continue
-            
-            return filename
-        except Exception as e:
-            # logger.warning(f"Piped Audio Error: {e}")
-            continue
+                return " ".join(list(dict.fromkeys(lines)))
+        except: continue
     return None
 
 # --- 4. 核心功能：分析影片 ---
@@ -176,7 +116,7 @@ def get_video_content(video_url):
         full_text = None
         source_type = "未知"
 
-        # 策略 A: 官方 API
+        # [策略 A] 官方 API (最快，優先嘗試)
         try:
             transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
             transcript = list(transcript_list)[0]
@@ -184,41 +124,64 @@ def get_video_content(video_url):
             source_type = "CC字幕(官方)"
         except: pass
 
-        # 策略 B: Piped 字幕
+        # [策略 B] yt-dlp Android 偽裝模式 (強力突圍)
+        # 這是 V21.0 的核心：不使用網頁版 API，而是模擬 Android 客戶端
+        if not full_text:
+            logger.info("啟動策略 B: yt-dlp (Android 偽裝模式)...")
+            try:
+                ydl_opts = {
+                    'format': 'bestaudio/best', 
+                    'outtmpl': '/tmp/%(id)s.%(ext)s',
+                    'noplaylist': True,
+                    'quiet': True,
+                    'no_warnings': True,
+                    'ignoreerrors': True,
+                    'nocheckcertificate': True,
+                    # 🔥 關鍵參數：欺騙 YouTube 我們是 Android 手機 App 🔥
+                    'extractor_args': {
+                        'youtube': {
+                            'player_client': ['android', 'ios'],
+                            'skip': ['dash', 'hls']
+                        }
+                    }
+                }
+                
+                filename = None
+                with yt_dlp.YoutubeDL(ydl_opts) as ydl:
+                    info = ydl.extract_info(video_url, download=True)
+                    if info:
+                        filename = ydl.prepare_filename(info)
+                
+                if filename and os.path.exists(filename):
+                    # 檔案太小可能是下載失敗的垃圾檔
+                    if os.path.getsize(filename) < 10240:
+                        os.remove(filename)
+                    else:
+                        with open(filename, "rb") as file:
+                            transcription = groq_client.audio.transcriptions.create(
+                                file=(filename, file.read()), model="whisper-large-v3", response_format="text"
+                            )
+                        if os.path.exists(filename): os.remove(filename)
+                        full_text = transcription
+                        source_type = "語音轉錄(Android偽裝)"
+            except Exception as e:
+                logger.error(f"yt-dlp Android 模式失敗: {e}")
+
+        # [策略 C] Piped 替身 (最後備援)
         if not full_text:
             proxy_text = get_transcript_via_piped(video_id)
             if proxy_text:
                 full_text = proxy_text
                 source_type = "CC字幕(替身)"
-
-        # 策略 C: Piped 音訊 + Groq (主要依靠這個)
-        if not full_text:
-            logger.info("啟動策略 C: Piped 音訊轉錄 (忍者模式)...")
-            audio_file = download_audio_via_piped(video_id)
-            if audio_file:
-                try:
-                    with open(audio_file, "rb") as file:
-                        transcription = groq_client.audio.transcriptions.create(
-                            file=(audio_file, file.read()), 
-                            model="whisper-large-v3", 
-                            response_format="text"
-                        )
-                    full_text = transcription
-                    source_type = "語音轉錄(Piped)"
-                    if os.path.exists(audio_file): os.remove(audio_file)
-                except Exception as e:
-                    logger.error(f"Groq 轉錄失敗: {e}")
-
-        # 策略 D 已移除：yt-dlp 在 Render 必死無疑，留著只會浪費時間。
         
         if not full_text:
-            return "失敗", "所有替身節點皆忙線或無法存取，請稍後再試。"
+            return "失敗", "所有策略皆失效 (YouTube 阻擋了伺服器連線)"
 
         return source_type, full_text
     except Exception as e:
         return "錯誤", str(e)
 
-# --- 5. AI 寫文章 (多金鑰安全版) ---
+# --- 5. AI 寫文章 ---
 def summarize_text(text):
     prompt = f"""
     你是一位專業主編。請閱讀以下影片內容，用「繁體中文」撰寫一篇重點懶人包。
@@ -296,7 +259,7 @@ def handle_message(event):
     
     if "youtube.com" in msg or "youtu.be" in msg:
         try:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！啟動背景分析 (忍者模式)..."))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！啟動 Android 模擬分析模式..."))
         except: pass
 
         thread = threading.Thread(target=process_video_task, args=(user_id, event.reply_token, msg))

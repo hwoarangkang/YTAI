@@ -90,37 +90,39 @@ def download_via_invidious(video_id):
         except: continue
     return None
 
-# --- Cookie 處理器 ---
-def create_cookie_file():
+# --- Cookie 處理器 (V30 改良版：優先讀檔) ---
+def get_cookie_path():
+    # 1. 最優先：檢查 GitHub 專案裡有沒有 cookies.txt
+    if os.path.exists('cookies.txt'):
+        logger.info("🍪 發現本地 cookies.txt 檔案，優先使用！(格式最穩)")
+        return 'cookies.txt'
+    
+    # 2. 次要：檢查環境變數 (容易格式跑掉，當作備用)
     cookie_content = os.environ.get('YOUTUBE_COOKIES')
-    if not cookie_content:
-        logger.warning("⚠️ 未偵測到 YOUTUBE_COOKIES，將嘗試裸連...")
-        return None
-    try:
-        fd, path = tempfile.mkstemp(suffix='.txt', text=True)
-        with os.fdopen(fd, 'w') as f:
-            f.write(cookie_content)
-        logger.info(f"🍪 Cookie 憑證已掛載: {path}")
-        return path
-    except Exception as e:
-        logger.error(f"Cookie 建立失敗: {e}")
-        return None
+    if cookie_content:
+        try:
+            fd, path = tempfile.mkstemp(suffix='.txt', text=True)
+            with os.fdopen(fd, 'w') as f:
+                f.write(cookie_content)
+            logger.info(f"🍪 使用環境變數建立臨時 Cookie: {path}")
+            return path
+        except: pass
+        
+    logger.warning("⚠️ 未偵測到任何 Cookie，將嘗試裸連 (失敗率高)...")
+    return None
 
-# --- 🔥 新增功能：Gemini 檔案上傳處理 (大檔案專用) ---
+# --- Gemini 檔案上傳處理 (大檔案專用) ---
 def summarize_large_audio_with_gemini(audio_path):
     """使用 Gemini 1.5 Flash 直接聽音檔 (繞過 Groq 25MB 限制)"""
     try:
         logger.info("🐘 檔案過大，切換至 Gemini 1.5 Flash 原生聽力模式...")
         
-        # 隨機選一個 Key
         current_key = random.choice(API_KEY_POOL)
         genai.configure(api_key=current_key)
         
-        # 上傳檔案到 Google AI Studio
         myfile = genai.upload_file(audio_path)
         logger.info(f"📤 檔案上傳中: {myfile.name}")
 
-        # 等待檔案處理完成 (通常幾秒鐘)
         while myfile.state.name == "PROCESSING":
             time.sleep(2)
             myfile = genai.get_file(myfile.name)
@@ -128,16 +130,11 @@ def summarize_large_audio_with_gemini(audio_path):
         if myfile.state.name == "FAILED":
             raise ValueError("Gemini 檔案處理失敗")
 
-        # 呼叫模型 (Gemini 1.5 Flash 對多媒體支援最好)
         model = genai.GenerativeModel("gemini-1.5-flash")
-        
         prompt = "你是一位專業主編。請聽這段音訊內容，用「繁體中文」撰寫一篇詳細的重點懶人包。內容要結構清晰，包含標題和條列式重點。"
         
         result = model.generate_content([myfile, prompt], safety_settings=safety_settings)
-        
-        # 刪除雲端檔案 (保持清潔)
         genai.delete_file(myfile.name)
-        
         return result.text
 
     except Exception as e:
@@ -153,7 +150,7 @@ def get_video_content(video_url):
         else:
             return "錯誤", "無法辨識網址"
 
-        # [策略 A] 官方字幕 (最優先)
+        # [策略 A] 官方字幕
         try:
             transcript_list = YouTubeTranscriptApi.list_transcripts(video_id)
             transcript = list(transcript_list)[0]
@@ -161,15 +158,15 @@ def get_video_content(video_url):
             return "CC字幕(官方)", full_text
         except: pass
 
-        # 下載音訊 (共用邏輯)
         audio_file = None
         source_type = "未知"
 
-        # [策略 B] yt-dlp (Cookie 驗證)
-        logger.info("啟動策略 B: yt-dlp (Cookie 驗證)...")
-        cookie_path = create_cookie_file()
+        # [策略 B] yt-dlp (Cookie 檔案驗證 + 瘦身)
+        logger.info("啟動策略 B: yt-dlp (Cookie/瘦身模式)...")
+        cookie_path = get_cookie_path() # 使用新的路徑取得函式
+        
         ydl_opts = {
-            'format': 'worstaudio/worst', # 最差音質以節省空間
+            'format': 'worstaudio/worst',
             'outtmpl': '/tmp/%(id)s.%(ext)s',
             'noplaylist': True,
             'quiet': True,
@@ -177,37 +174,44 @@ def get_video_content(video_url):
             'ignoreerrors': True,
             'nocheckcertificate': True
         }
-        if cookie_path: ydl_opts['cookiefile'] = cookie_path
-        else: ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android']}}
+        
+        if cookie_path: 
+            ydl_opts['cookiefile'] = cookie_path
+        else: 
+            ydl_opts['extractor_args'] = {'youtube': {'player_client': ['android']}}
 
         try:
             filename = None
             with yt_dlp.YoutubeDL(ydl_opts) as ydl:
                 info = ydl.extract_info(video_url, download=True)
                 if info: filename = ydl.prepare_filename(info)
-            if filename and os.path.exists(filename) and os.path.getsize(filename) > 10240:
-                audio_file = filename
-                source_type = "yt-dlp"
+            
+            if filename and os.path.exists(filename):
+                if os.path.getsize(filename) > 10240:
+                    audio_file = filename
+                    source_type = "yt-dlp"
         except Exception as e:
             logger.error(f"yt-dlp 失敗: {e}")
         finally:
-            if cookie_path and os.path.exists(cookie_path): os.remove(cookie_path)
+            # 只刪除臨時產生的 cookie，如果是上傳的 cookies.txt 則保留
+            if cookie_path and cookie_path != 'cookies.txt' and os.path.exists(cookie_path):
+                os.remove(cookie_path)
 
-        # [策略 C] Invidious 替身 (如果 yt-dlp 失敗)
+        # [策略 C] Invidious
         if not audio_file:
             logger.info("啟動策略 C: Invidious 替身...")
             audio_file = download_via_invidious(video_id)
             if audio_file: source_type = "Invidious"
 
-        # --- 🔥 關鍵分流處理 ---
+        # --- 分流處理 ---
         if audio_file:
             file_size_mb = os.path.getsize(audio_file) / (1024 * 1024)
             logger.info(f"🎵 音訊檔案大小: {file_size_mb:.2f} MB")
 
             try:
-                # 分流判斷：小檔用 Groq，大檔用 Gemini
-                if file_size_mb < 24: # 安全起見設 24MB
-                    logger.info("⚡ 檔案 < 25MB，使用 Groq 轉錄...")
+                # 24MB 為界線
+                if file_size_mb < 24:
+                    logger.info("⚡ 小檔案，使用 Groq 轉錄...")
                     with open(audio_file, "rb") as file:
                         transcription = groq_client.audio.transcriptions.create(
                             file=(audio_file, file.read()), model="whisper-large-v3", response_format="text"
@@ -215,12 +219,10 @@ def get_video_content(video_url):
                     content = transcription
                     source_desc = f"語音轉錄({source_type}/Groq)"
                 else:
-                    logger.info("🐘 檔案 > 25MB，使用 Gemini 直接分析...")
-                    # 這裡直接回傳分析結果，跳過後面的 summarize_text
+                    logger.info("🐘 大檔案，使用 Gemini 原生分析...")
                     summary = summarize_large_audio_with_gemini(audio_file)
                     if os.path.exists(audio_file): os.remove(audio_file)
-                    # 加上特殊標記，讓後面的程式知道這已經是總結了
-                    return f"Gemini聽力({source_type})", summary 
+                    return f"Gemini聽力({source_type})", summary
 
                 if os.path.exists(audio_file): os.remove(audio_file)
                 return source_desc, content
@@ -229,15 +231,14 @@ def get_video_content(video_url):
                 if os.path.exists(audio_file): os.remove(audio_file)
                 return "失敗", f"轉錄/分析過程發生錯誤: {str(e)}"
 
-        return "失敗", "無法下載內容 (Cookie 可能失效或影片受保護)"
+        return "失敗", "無法下載內容 (請確認 cookies.txt 是否已上傳至 GitHub)"
 
     except Exception as e:
         return "錯誤", str(e)
 
 # --- 5. AI 寫文章 ---
 def summarize_text(text):
-    # 如果傳進來的是已經寫好的 Gemini 總結 (大檔案模式)，直接回傳
-    if text.startswith("##") or "懶人包" in text or "重點" in text:
+    if text.startswith("##") or "懶人包" in text:
         return text
 
     prompt = f"""
@@ -274,17 +275,15 @@ def summarize_text(text):
 # --- 背景任務 ---
 def process_video_task(user_id, reply_token, msg):
     try:
-        # 1. 獲取內容 (可能是文字，也可能是已經做好的總結)
         source, content = get_video_content(msg)
         
         if source == "失敗" or source == "錯誤":
             result_msg = f"❌ {content}"
         else:
-            # 2. 如果是文字，就做總結；如果是已完成的總結(大檔模式)，直接用
             if "Gemini聽力" in source:
-                summary = content # 已經是總結了，不用再 call AI
+                summary = content
             else:
-                summary = summarize_text(content) # 還需要總結
+                summary = summarize_text(content)
             
             result_msg = f"✅ 分析完成 ({source})\n\n{summary}"
         
@@ -315,7 +314,7 @@ def handle_message(event):
     
     if "youtube.com" in msg or "youtu.be" in msg:
         try:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！啟用「雙引擎 (Groq/Gemini)」分析中..."))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！啟用「V30 實體Cookie」分析..."))
         except: pass
 
         thread = threading.Thread(target=process_video_task, args=(user_id, event.reply_token, msg))

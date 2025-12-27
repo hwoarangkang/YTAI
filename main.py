@@ -3,6 +3,7 @@ import re
 import requests
 import json
 import logging
+import random
 from flask import Flask, request, abort
 from linebot import LineBotApi, WebhookHandler
 from linebot.exceptions import InvalidSignatureError
@@ -19,32 +20,25 @@ logger = logging.getLogger(__name__)
 
 app = Flask(__name__)
 
-# --- 1. 設定 API 金鑰 ---
+# --- 1. 設定 API 金鑰庫 (安全讀取版) ---
+# 從環境變數讀取金鑰，而不是寫死在程式碼裡
+raw_keys = [
+    os.environ.get('GEMINI_API_KEY_1'),
+    os.environ.get('GEMINI_API_KEY_2'),
+    os.environ.get('GEMINI_API_KEY_3'),
+    os.environ.get('GEMINI_API_KEY') # 兼容舊設定
+]
+
+# 過濾掉空的 Key (避免讀到 None)
+API_KEY_POOL = [k for k in raw_keys if k and k.strip()]
+
+if not API_KEY_POOL:
+    logger.error("❌ 嚴重錯誤: 環境變數中找不到任何 GEMINI_API_KEY！")
+
+# LINE 設定
 line_bot_api = LineBotApi(os.environ.get('LINE_CHANNEL_ACCESS_TOKEN'))
 handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
-
-api_key = os.environ.get('GEMINI_API_KEY')
-if not api_key:
-    logger.error("❌ 嚴重錯誤: 找不到 GEMINI_API_KEY 環境變數！")
-genai.configure(api_key=api_key)
-
 groq_client = Groq(api_key=os.environ.get('GROQ_API_KEY'))
-
-# --- 🚀 啟動時診斷：列出可用模型 (關鍵除錯步驟) ---
-# 這段程式碼會告訴我們，你的 API Key 到底有沒有權限，以及能看到哪些模型。
-try:
-    logger.info("🔍 [診斷模式] 正在測試 API Key 連線與可用模型清單...")
-    available_models = []
-    for m in genai.list_models():
-        if 'generateContent' in m.supported_generation_methods:
-            available_models.append(m.name)
-    
-    if available_models:
-        logger.info(f"✅ API Key 測試成功！可用模型如下:\n{available_models}")
-    else:
-        logger.warning("⚠️ API Key 連線成功，但清單是空的 (可能沒有權限或地區限制)")
-except Exception as e:
-    logger.error(f"❌ API Key 測試失敗 (這就是 404 的原因): {e}")
 
 # --- 2. 設定 Gemini 安全過濾 ---
 safety_settings = {
@@ -141,7 +135,7 @@ def get_video_content(video_url):
     except Exception as e:
         return "錯誤", str(e)
 
-# --- 5. 核心功能：AI 寫文章 (動態清單版) ---
+# --- 5. 核心功能：AI 寫文章 (多金鑰安全版) ---
 def summarize_text(text):
     prompt = f"""
     你是一位專業主編。請閱讀以下影片內容，用「繁體中文」撰寫一篇重點懶人包。
@@ -149,30 +143,47 @@ def summarize_text(text):
     {text[:30000]}
     """
 
-    # 優先順序：2.0 Flash -> 1.5 Flash 002 -> 1.5 Flash -> 1.5 Pro
+    # 你的可用模型清單 (根據之前 Log 確認過的)
     priority_models = [
-        "gemini-2.0-flash-exp", 
-        "gemini-1.5-flash-002",
-        "gemini-1.5-flash",
-        "gemini-1.5-pro"
+        "gemini-2.5-flash",        
+        "gemini-2.0-flash-exp",    
+        "gemini-2.5-flash-lite",   
+        "gemini-2.0-flash-lite-preview-02-05" 
     ]
 
-    last_error = ""
+    # --- 智慧金鑰輪替邏輯 ---
+    # 複製金鑰池 (避免影響全域變數)
+    keys_to_try = API_KEY_POOL.copy()
+    random.shuffle(keys_to_try) # 隨機洗牌，達成負載平衡
     
-    # 這裡的改動：印出我們正在嘗試哪個模型
-    for model_name in priority_models:
-        try:
-            logger.info(f"🤖 正在呼叫模型: {model_name}")
-            model = genai.GenerativeModel(model_name)
-            response = model.generate_content(prompt, safety_settings=safety_settings)
-            return response.text
-        except Exception as e:
-            error_msg = str(e)
-            logger.error(f"❌ 模型 {model_name} 失敗: {error_msg}")
-            last_error = error_msg
-            continue
+    last_error = ""
 
-    return f"AI 全部失敗 (Code 0.8.6)。錯誤原因: {last_error}"
+    for key_index, current_key in enumerate(keys_to_try):
+        # 隱碼處理 log
+        masked_key = current_key[:5] + "..." + current_key[-4:]
+        logger.info(f"🔑 [Key {key_index+1}/{len(keys_to_try)}] 切換金鑰: {masked_key}")
+        
+        genai.configure(api_key=current_key)
+
+        for model_name in priority_models:
+            try:
+                logger.info(f"🤖 嘗試模型: {model_name}")
+                model = genai.GenerativeModel(model_name)
+                response = model.generate_content(prompt, safety_settings=safety_settings)
+                return response.text 
+            except Exception as e:
+                error_msg = str(e)
+                if "429" in error_msg:
+                    logger.warning(f"⚠️ 額度不足 (429) - 模型: {model_name}，準備切換...")
+                elif "404" in error_msg:
+                    logger.warning(f"⚠️ 模型未授權 (404) - 模型: {model_name}，跳過...")
+                else:
+                    logger.error(f"❌ 錯誤: {error_msg}")
+                
+                last_error = error_msg
+                continue 
+
+    return f"AI 生成失敗 (已嘗試 {len(keys_to_try)} 組 Key)。最後錯誤: {last_error}"
 
 # --- 6. LINE Webhook ---
 @app.route("/callback", methods=['POST'])
@@ -191,14 +202,14 @@ def handle_message(event):
     user_id = event.source.user_id
     if "youtube.com" in msg or "youtu.be" in msg:
         try:
-            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 分析運算中..."))
+            line_bot_api.reply_message(event.reply_token, TextSendMessage(text="🤖 收到！多核心 AI 分析中..."))
         except: pass
         source, content = get_video_content(msg)
         if source == "失敗" or source == "錯誤":
             result_msg = f"❌ {content}"
         else:
             summary = summarize_text(content)
-            result_msg = f"✅ 完成 ({source})\n\n{summary}"
+            result_msg = f"✅ 分析完成 ({source})\n\n{summary}"
         try:
             line_bot_api.push_message(user_id, TextSendMessage(text=result_msg))
         except: pass

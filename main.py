@@ -20,7 +20,7 @@ handler = WebhookHandler(os.environ.get('LINE_CHANNEL_SECRET'))
 genai.configure(api_key=os.environ.get('GEMINI_API_KEY'))
 groq_client = Groq(api_key=os.environ.get('GROQ_API_KEY'))
 
-# --- 2. 設定 Gemini 安全過濾 (關鍵！防止拒絕生成) ---
+# --- 2. 設定 Gemini 安全過濾 (防止拒絕生成) ---
 safety_settings = {
     HarmCategory.HARM_CATEGORY_HARASSMENT: HarmBlockThreshold.BLOCK_NONE,
     HarmCategory.HARM_CATEGORY_HATE_SPEECH: HarmBlockThreshold.BLOCK_NONE,
@@ -120,7 +120,6 @@ def get_video_content(video_url):
                 source_type = "CC字幕(替身)"
 
         # [策略 C] 下載音訊轉錄 (Groq) - 最後手段
-        # 注意：Render IP 容易在此步驟被擋 (Sign in required)，但仍保留作為最後嘗試
         if not full_text:
             try:
                 print("策略 C: 嘗試語音轉錄 (Groq)...")
@@ -151,28 +150,42 @@ def get_video_content(video_url):
     except Exception as e:
         return "錯誤", str(e)
 
-# --- 5. 核心功能：AI 寫文章 ---
+# --- 5. 核心功能：AI 寫文章 (智慧雙模組 V17.22) ---
 def summarize_text(text):
-    try:
-        model = genai.GenerativeModel('gemini-1.5-flash')
-        
-        prompt = f"""
-        你是一位專業主編。請閱讀以下影片內容，用「繁體中文」撰寫一篇重點懶人包。
-        
-        【要求】
-        1. 標題：吸睛且精準。
-        2. 結構：前言、核心重點（條列式）、結論。
-        3. 語氣：通順流暢，去除逐字稿的口語贅字。
-        
-        【內容】
-        {text[:30000]}
-        """
-        
-        # 加入 safety_settings 參數
-        response = model.generate_content(prompt, safety_settings=safety_settings)
-        return response.text
-    except Exception as e:
-        return f"AI 生成失敗: {str(e)}"
+    prompt = f"""
+    你是一位專業主編。請閱讀以下影片內容，用「繁體中文」撰寫一篇重點懶人包。
+    
+    【要求】
+    1. 標題：吸睛且精準。
+    2. 結構：前言、核心重點（條列式）、結論。
+    3. 語氣：通順流暢，去除逐字稿的口語贅字。
+    
+    【內容】
+    {text[:30000]}
+    """
+
+    # 定義模型優先順序 (模擬你的 JS 排序邏輯)
+    # 1. gemini-2.0-flash-exp: 目前最新的實驗版 (對應坊間的 2.5)
+    # 2. gemini-1.5-flash: 穩定且快速
+    priority_models = [
+        "gemini-2.0-flash-exp", 
+        "gemini-1.5-flash"
+    ]
+
+    last_error = ""
+
+    for model_name in priority_models:
+        try:
+            print(f"嘗試使用模型: {model_name} ...")
+            model = genai.GenerativeModel(model_name)
+            response = model.generate_content(prompt, safety_settings=safety_settings)
+            return response.text # 成功則直接回傳
+        except Exception as e:
+            print(f"模型 {model_name} 失敗: {e}")
+            last_error = str(e)
+            continue # 失敗則嘗試下一個模型
+
+    return f"AI 生成失敗 (所有模型皆嘗試過): {last_error}"
 
 # --- 6. LINE Webhook ---
 @app.route("/callback", methods=['POST'])
